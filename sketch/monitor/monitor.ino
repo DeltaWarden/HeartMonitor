@@ -3,6 +3,7 @@
 #include <ESPAsyncWebServer.h>
 #include <OneWire.h>
 #include <LiquidCrystal_I2C.h>
+#include <ArduinoJson.h>
 
 // -------------------- CONFIG --------------------
 struct Config {
@@ -10,10 +11,10 @@ struct Config {
   String pass = "12345678";
   int adcPin = 34;          // аналог датчика пульса (0..4095)
   int tempPin = 2;          // DS18B20
-  unsigned long sampleInterval = 4;     // период чтения ADC
+  unsigned long sampleInterval = 4;     // период чтения ADC (мс)
   unsigned long pushInterval   = 300;   // период отправки батчей
   unsigned long tempInterval   = 5000;  // измерять температуру раз в 5с
-  int rawBufSize = 900;                 // размер буфера сырого окна
+  int rawBufSize = 900;                 // размер буфера
 } cfg;
 
 // -------------------- GLOBALS --------------------
@@ -38,7 +39,7 @@ unsigned long lastSample = 0;
 unsigned long lastPush   = 0;
 unsigned long lastTempTick = 0;
 
-// BPM детектор
+// BPM
 static const int IBI_N = 6;
 unsigned long lastBeatAt = 0;
 unsigned long ibi[IBI_N];
@@ -52,7 +53,7 @@ const int SMOOTH_N = 8;
 int smoothBuf[SMOOTH_N];
 int smoothIdx = 0;
 
-// LCD полоса
+// LCD линия
 char lineBuf[17];
 int linePos = 0;
 
@@ -92,7 +93,7 @@ bool owSearchRom() {
   if (!ow) return false;
   ow->reset_search();
   if (!ow->search(dsRom)) return false;
-  if (dsRom[0] != 0x28) return false; // DS18B20
+  if (dsRom[0] != 0x28) return false;
   haveRom = true;
   return true;
 }
@@ -102,7 +103,7 @@ void tempStartConversion() {
   if (!haveRom && !owSearchRom()) return;
   ow->reset();
   ow->select(dsRom);
-  ow->write(0x44, 1); // convert T
+  ow->write(0x44, 1);
 }
 
 bool tempReadOnce(float &outC) {
@@ -155,7 +156,6 @@ void updateBpmFromNorm(int xNorm) {
     }
     lastBeatAt = now;
   }
-
   up = rising;
   last = xNorm;
 }
@@ -195,30 +195,11 @@ void lcdUpdate() {
   lcd.print("BPM:");
   if (bpm > 0) lcd.print(bpm); else lcd.print("-- ");
 
-  int level = map(rawBuf[(rawHead - 1 + cfg.rawBufSize) % cfg.rawBufSize], 0, 1023, 0, 7);
-  char symbol;
-  switch(level) {
-    case 0: symbol = '_'; break;
-    case 1: symbol = '.'; break;
-    case 2: symbol = '-'; break;
-    case 3: symbol = '^'; break;
-    case 4: symbol = '*'; break;
-    case 5: symbol = 'n'; break;
-    case 6: symbol = 'M'; break;
-    default: symbol = '#'; break;
-  }
-  lineBuf[linePos] = symbol;
-  linePos = (linePos + 1) % 16;
-  for (int i=0;i<16;i++) {
-    lcd.setCursor(i,0);
-    lcd.print(lineBuf[(linePos+i)%16]);
-  }
-
   lcd.setCursor(0,1);
   lcd.print("T:");
   if (!isnan(bodyTemp)) {
     lcd.print(bodyTemp,1);
-    lcd.print((char)223); // градус
+    lcd.print((char)223);
     lcd.print("C   ");
   } else {
     lcd.print("--.-C   ");
@@ -240,16 +221,26 @@ void setup() {
       Serial.printf("[WS] Client #%u connected\n", client->id());
     } else if (type == WS_EVT_DISCONNECT) {
       Serial.printf("[WS] Client #%u disconnected\n", client->id());
+    } else if (type == WS_EVT_DATA) {
+      AwsFrameInfo *info = (AwsFrameInfo*)arg;
+      if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+        String msg = String((char*)data).substring(0, len);
+        StaticJsonDocument<128> doc;
+        if (deserializeJson(doc, msg) == DeserializationError::Ok) {
+          if (doc["cmd"] == "setHz") {
+            cfg.sampleInterval = doc["value"];
+            Serial.printf("[CMD] sampleInterval = %lu\n", cfg.sampleInterval);
+          }
+        }
+      }
     }
   });
   server.addHandler(&ws);
 
-  // глобальные CORS заголовки
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "Content-Type");
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
 
-  // endpoint /status
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *req){
     String s = "{\"ssid\":\"" + WiFi.SSID() + "\",\"ip\":\"" + WiFi.localIP().toString() + "\",\"rssi\":" + String(WiFi.RSSI()) + "}";
     auto *res = req->beginResponse(200, "application/json", s);
@@ -258,7 +249,6 @@ void setup() {
   });
 
   server.begin();
-
   tempStartConversion(); 
 }
 
